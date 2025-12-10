@@ -2,6 +2,114 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import os
+from torch.utils.data import Dataset, DataLoader
+import soundfile as sf
+# 导入你提供的AudioProcessor
+from audio_processor import AudioProcessor
+
+class DenoiseDataset(Dataset):
+    """降噪数据集：适配你提供的AudioProcessor"""
+    def __init__(self, clean_audio_dir: str, noisy_audio_dir: str, 
+                 sample_rate: int = 16000, seq_len: int = 100):
+        """
+        Args:
+            clean_audio_dir: 干净语音目录
+            noisy_audio_dir: 带噪语音目录（文件名与干净语音一一对应）
+            sample_rate: 采样率（需与AudioProcessor一致）
+            seq_len: 固定序列长度（模型输入的时间步长）
+        """
+        self.clean_dir = clean_audio_dir
+        self.noisy_dir = noisy_audio_dir
+        self.seq_len = seq_len
+        self.sample_rate = sample_rate
+        
+        # 初始化你提供的AudioProcessor
+        self.audio_processor = AudioProcessor(
+            sample_rate=sample_rate,
+            frame_size=160,  # 10ms @ 16kHz
+            hop_size=80     # 5ms @ 16kHz
+        )
+        
+        # 匹配干净/带噪语音文件（仅保留.wav）
+        self.file_list = [
+            f for f in os.listdir(clean_audio_dir) 
+            if f.endswith('.wav') and os.path.exists(os.path.join(noisy_dir, f))
+        ]
+        if not self.file_list:
+            raise ValueError("未找到匹配的干净/带噪语音文件对")
+
+    def __len__(self) -> int:
+        return len(self.file_list)
+
+    def __getitem__(self, idx: int) -> dict:
+        # 1. 加载音频文件（确保单通道、采样率一致）
+        file_name = self.file_list[idx]
+        clean_audio, sr_clean = sf.read(os.path.join(self.clean_dir, file_name))
+        noisy_audio, sr_noisy = sf.read(os.path.join(self.noisy_dir, file_name))
+        
+        # 校验采样率
+        if sr_clean != self.sample_rate or sr_noisy != self.sample_rate:
+            raise ValueError(f"采样率不匹配：{file_name} 需为{self.sample_rate}Hz")
+        
+        # 转为单通道（若为立体声）
+        if len(clean_audio.shape) > 1:
+            clean_audio = np.mean(clean_audio, axis=1)
+        if len(noisy_audio.shape) > 1:
+            noisy_audio = np.mean(noisy_audio, axis=1)
+        
+        # 确保音频长度一致（截断到较短的长度）
+        min_len = min(len(clean_audio), len(noisy_audio))
+        clean_audio = clean_audio[:min_len]
+        noisy_audio = noisy_audio[:min_len]
+
+        # 2. STFT变换（使用你提供的stft方法）
+        clean_stft = self.audio_processor.stft(clean_audio)  # (freq_bins, n_frames)
+        noisy_stft = self.audio_processor.stft(noisy_audio)
+        
+        # 3. 计算幅度谱（用于特征提取和增益计算）
+        clean_mag = self.audio_processor.compute_magnitude_spectrum(clean_stft)
+        noisy_mag = self.audio_processor.compute_magnitude_spectrum(noisy_stft)
+
+        # 4. 提取模型输入特征（25维：22子带+3频谱特征）
+        noisy_features = self.audio_processor.compute_spectral_features(noisy_mag)  # (25, n_frames)
+        
+        # 5. 计算目标增益（22维巴克子带增益）
+        # 目标增益 = 干净子带能量 / 带噪子带能量（限制在[0,1]）
+        clean_subband = self.audio_processor.decompose_to_subbands(clean_mag)  # (22, n_frames)
+        noisy_subband = self.audio_processor.decompose_to_subbands(noisy_mag)
+        target_gains = clean_subband / (noisy_subband + 1e-8)  # 避免除零
+        target_gains = np.clip(target_gains, 0.0, 1.0)  # 增益范围[0,1]
+
+        # 6. 截断/补零到固定序列长度（保证批次维度一致）
+        n_frames = noisy_features.shape[1]
+        if n_frames < self.seq_len:
+            # 补零：(25, seq_len) / (22, seq_len) / (freq_bins, seq_len)
+            pad_len = self.seq_len - n_frames
+            noisy_features = np.pad(noisy_features, ((0,0), (0,pad_len)), mode='constant')
+            target_gains = np.pad(target_gains, ((0,0), (0,pad_len)), mode='constant')
+            clean_mag = np.pad(clean_mag, ((0,0), (0,pad_len)), mode='constant')
+            noisy_mag = np.pad(noisy_mag, ((0,0), (0,pad_len)), mode='constant')
+        else:
+            # 随机截断（数据增强）
+            start_idx = np.random.randint(0, n_frames - self.seq_len + 1)
+            noisy_features = noisy_features[:, start_idx:start_idx+self.seq_len]
+            target_gains = target_gains[:, start_idx:start_idx+self.seq_len]
+            clean_mag = clean_mag[:, start_idx:start_idx+self.seq_len]
+            noisy_mag = noisy_mag[:, start_idx:start_idx+self.seq_len]
+
+        # 7. 维度转置：(feat_dim, seq_len) → (seq_len, feat_dim)（适配模型输入）
+        noisy_features = noisy_features.T  # (seq_len, 25)
+        target_gains = target_gains.T      # (seq_len, 22)
+
+        # 8. 转换为Tensor（float32）
+        return {
+            "noisy_features": torch.FloatTensor(noisy_features),    # [seq_len, 25]
+            "target_gains": torch.FloatTensor(target_gains),        # [seq_len, 22]
+            "clean_spectrum": torch.FloatTensor(clean_mag),         # [freq_bins, seq_len]
+            "noisy_spectrum": torch.FloatTensor(noisy_mag)          # [freq_bins, seq_len]
+        }
+
 
 class CRNNDenoiseModel(nn.Module):
     """CRNN降噪模型，实现ZegoAIDenoise的神经网络部分"""
@@ -173,7 +281,13 @@ def create_pretrained_model() -> CRNNDenoiseModel:
     
     # 这里可以添加预训练权重加载逻辑
     # 由于时间和资源限制，我们使用随机初始化的模型进行演示
+        """加载训练好的模型"""
+    #model = CRNNDenoiseModel(input_dim=25, hidden_dim=128, num_layers=3, output_dim=22)
     
+    # 加载权重
+    # checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
     return model
 
 class RealTimeDenoiser:
